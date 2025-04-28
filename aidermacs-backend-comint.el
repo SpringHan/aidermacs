@@ -1,6 +1,6 @@
 ;;; aidermacs-backend-comint.el --- Comint backend for aidermacs -*- lexical-binding: t; -*-
 ;; Author: Mingde (Matthew) Zeng <matthewzmd@posteo.net>
-;; Version: 1.0
+;; Version: 1.3
 ;; Keywords: ai emacs llm aider ai-pair-programming tools
 ;; URL: https://github.com/MatthewZMD/aidermacs
 ;; SPDX-License-Identifier: Apache-2.0
@@ -26,6 +26,7 @@
 (require 'comint)
 (require 'cl-lib)
 (require 'map)
+(require 'markdown-mode)
 
 ;; Forward declarations
 (declare-function aidermacs--prepare-for-code-edit "aidermacs-output")
@@ -39,6 +40,7 @@
 (declare-function aidermacs--detect-edited-files "aidermacs-output")
 
 (defvar aidermacs--last-command)
+(defvar diff-update-on-the-fly)
 
 (defgroup aidermacs-backend-comint nil
   "Comint backend for Aidermacs."
@@ -60,7 +62,7 @@
 (defconst aidermacs-replace-marker ">>>>>>> REPLACE")
 (defconst aidermacs-fence-marker "```")
 (defvar aidermacs-block-re
-  (format "^\\(?:\\(?1:%s\\|%s\\)\\|\\(?1:%s\\).+\\)$" aidermacs-search-marker aidermacs-diff-marker aidermacs-fence-marker))
+  (format "^\\(?:\\(?1:%s\\|%s\\).*\\)$" aidermacs-search-marker aidermacs-fence-marker))
 
 (defcustom aidermacs-comint-multiline-newline-key "S-<return>"
   "Key binding for `comint-accumulate' in Aidermacs buffers.
@@ -83,10 +85,8 @@ This allows for multi-line input without sending the command."
 (defvar aidermacs-font-lock-keywords
   '(("^\x2500+\n?" 0 '(face aidermacs-command-separator) t)
     ("^\x2500+" 0 '(face nil display (space :width 2)))
-    ("^\\([0-9]+\\). " 0 font-lock-constant-face)
     ("^>>>>>>> REPLACE" 0 'aidermacs-search-replace-block t)
     ("^<<<<<<< SEARCH" 0 'aidermacs-search-replace-block t)
-    ("^[:space:]*\\(```\\)\\([^[:space:]]*\\)" (1 'shadow t) (2 font-lock-builtin-face t))
     ("^=======$" 0 'aidermacs-search-replace-block t))
   "Font lock keywords for aidermacs buffer.")
 
@@ -106,10 +106,10 @@ This allows for multi-line input without sending the command."
 (defvar-local aidermacs--syntax-work-buffer nil
   "Temporary buffer used for syntax highlighting operations.")
 
-(defvar-local aidermacs--syntax-block-marker nil
-  "Store the current block marker (SEARCH/REPLACE/fence) being processed.
-This variable holds the actual marker text (e.g., <<<<<<< SEARCH, =======, etc.)
-that was matched at the start of the current syntax block.")
+(defvar-local aidermacs--syntax-state nil
+  "Current syntax parser state list.
+The head of the list is the current state and all remaining elements
+are next states.")
 
 (defvar-local aidermacs--comint-output-temp ""
   "Temporary output variable storing the raw output string.")
@@ -134,71 +134,85 @@ that was matched at the start of the current syntax block.")
 (defun aidermacs-reset-font-lock-state ()
   "Reset font lock state to default for processing a new source block."
   (setq aidermacs--syntax-block-delimiter nil
-        aidermacs--syntax-last-output-pos nil
         aidermacs--syntax-block-start-pos nil
         aidermacs--syntax-block-end-pos nil
-        aidermacs--syntax-block-marker nil))
+        aidermacs--syntax-state nil
+        aidermacs--syntax-last-output-pos nil))
+
+(defun aidermacs--set-syntax-major-mode ()
+(let ((mode (aidermacs--guess-major-mode)))
+  (with-current-buffer aidermacs--syntax-work-buffer
+    (unless (eq mode major-mode)
+      (condition-case e
+          (let ((inhibit-message t)
+                (diff-update-on-the-fly nil))
+            (funcall mode))
+        (error "aidermacs: Failed to init major-mode `%s' for font-locking: %s" mode e))))))
 
 (defun aidermacs-fontify-blocks (_output)
   "Fontify search/replace blocks in comint output.
 _OUTPUT is the text to be processed."
-  (save-excursion
-    (goto-char (or aidermacs--syntax-last-output-pos
-                   comint-last-output-start))
-    (beginning-of-line)
-
-    ;; Continue processing existing block if we're in one
-    (when aidermacs--syntax-block-start-pos
-      (aidermacs--fontify-block))
-
-    (setq aidermacs--syntax-last-output-pos nil)
-    ;; Look for new blocks if we're not in one
-    (while (and (null aidermacs--syntax-block-start-pos)
-                (null aidermacs--syntax-last-output-pos)
-                (re-search-forward aidermacs-block-re nil t))
-
-      ;; If it is code fence marker, we need to check if there is a SEARCH marker
-      ;; directly after it
-      (when (equal (match-string 1) aidermacs-fence-marker)
-        (let* ((next-line (min (point-max) (1+ (line-end-position))))
-               (line-text (buffer-substring
-                           next-line
-                           (min (point-max) (+ next-line (length aidermacs-search-marker))))))
-          (cond ((equal line-text aidermacs-search-marker)
-                 ;; Next line is a SEARCH marker. use that instead of the fence marker
-                 (re-search-forward (format "^\\(%s\\)" aidermacs-search-marker) nil t))
-                ((string-prefix-p line-text aidermacs-search-marker)
-                 ;; Next line *might* be a SEARCH marker. Don't process more of
-                 ;; the buffer until we know for sure
-                 (setq aidermacs--syntax-last-output-pos comint-last-output-start)))))
-
+  (let (end)
+    (while (not end)
       (unless aidermacs--syntax-last-output-pos
-        ;; Set up new block state
-        (setq aidermacs--syntax-block-marker (match-string 1))
-        (setq aidermacs--syntax-block-start-pos (line-end-position)
-              aidermacs--syntax-block-end-pos (line-end-position)
-              aidermacs--syntax-block-delimiter
-              (pcase aidermacs--syntax-block-marker
-                ((pred (equal aidermacs-search-marker)) aidermacs-diff-marker)
-                ((pred (equal aidermacs-diff-marker)) aidermacs-replace-marker)
-                ((pred (equal aidermacs-fence-marker)) aidermacs-fence-marker)))
-
-        (with-current-buffer aidermacs--syntax-work-buffer
-          (erase-buffer))
-
-        ;; Set the major-mode of the font lock buffer unless this is the second half of
-        ;; SEARCH/REPLACE block. In that case reuse the previous mode
-        (unless (equal aidermacs--syntax-block-marker aidermacs-diff-marker)
-          (let ((mode (aidermacs--guess-major-mode)))
-            (with-current-buffer aidermacs--syntax-work-buffer
-              (unless (eq mode major-mode)
-                (condition-case e
-                    (let ((inhibit-message t))
-                      (funcall mode))
-                  (error "aidermacs: Failed to init major-mode `%s' for font-locking: %s" mode e))))))
-
-        ;; Process initial content
-        (aidermacs--fontify-block)))))
+        (setq aidermacs--syntax-last-output-pos comint-last-output-start))
+      (goto-char aidermacs--syntax-last-output-pos)
+      ;; (message "state: %s (%d)" aidermacs--syntax-state (point))
+      (pcase (car aidermacs--syntax-state)
+        ('nil
+         (if (re-search-forward aidermacs-block-re nil t)
+             (setq aidermacs--syntax-last-output-pos (point)
+                   aidermacs--syntax-state (if (equal aidermacs-search-marker (match-string 1))
+                                               '(search-block)
+                                             '(fence)))
+           (goto-char (point-max))
+           (setq aidermacs--syntax-last-output-pos
+                 (max aidermacs--syntax-last-output-pos (line-beginning-position)))
+           (setq end t)))
+        ('fence
+         (let* ((next-line (min (point-max) (1+ (line-end-position))))
+                (line-text (buffer-substring
+                            next-line
+                            (min (point-max) (+ next-line (length aidermacs-search-marker))))))
+           (cond ((equal line-text aidermacs-search-marker)
+                  ;; Next line is a SEARCH marker. use that instead of the fence marker
+                  (re-search-forward (format "^\\(%s\\)" aidermacs-search-marker) nil t)
+                  (setq aidermacs--syntax-state '(search-block fence-end)
+                        aidermacs--syntax-last-output-pos (point)))
+                 ((string-prefix-p line-text aidermacs-search-marker)
+                  ;; Next line *might* be a SEARCH marker. Don't process more of
+                  ;; the buffer until we know for sure
+                  (setq end t))
+                 (t
+                  ;; next line is not a search marker. This is a code fenced block.
+                  (setq aidermacs--syntax-state '(fence-block))))))
+        ((and state (or 'fence-block 'search-block 'replace-block))
+         (with-current-buffer aidermacs--syntax-work-buffer
+           (erase-buffer))
+         (setq aidermacs--syntax-block-start-pos (line-end-position)
+               aidermacs--syntax-block-end-pos (line-end-position)
+               aidermacs--syntax-block-delimiter
+               (pcase state
+                 ('fence-block (aidermacs--set-syntax-major-mode)
+                               aidermacs-fence-marker)
+                 ('search-block (aidermacs--set-syntax-major-mode)
+                                aidermacs-diff-marker)
+                 ;; if this is replace block, we will reuse the previous major mode
+                 ('replace-block aidermacs-replace-marker)))
+         (pop aidermacs--syntax-state)
+         (if (equal 'search-block state)
+             (push 'replace-block aidermacs--syntax-state))
+         (push 'block-body aidermacs--syntax-state))
+        ('fence-end
+         (if (re-search-forward "^```" nil t)
+             (setq aidermacs--syntax-last-output-pos (point)
+                   aidermacs--syntax-state nil)
+           (setq end t)))
+        ('block-body
+         (if (aidermacs--fontify-block)
+             (progn (pop aidermacs--syntax-state)
+                    (setq aidermacs--syntax-last-output-pos (point)))
+           (setq end t)))))))
 
 (defun aidermacs--fontify-block ()
   "Fontify as much of the current source block as possible."
@@ -231,29 +245,29 @@ _OUTPUT is the text to be processed."
       ;; Insert the new text and get the fontified result
       (with-current-buffer aidermacs--syntax-work-buffer
         (goto-char (point-max))
-        (insert new-content)
-        (with-demoted-errors "aidermacs block font lock error: %s"
+        (with-demoted-errors "aidermacs block font lock error: %S"
           (let ((inhibit-message t))
+            (insert new-content)
             (font-lock-ensure)))
         (setq fontified (buffer-string)))
 
       ;; Apply the faces to the buffer
       (remove-overlays aidermacs--syntax-block-start-pos aidermacs--syntax-block-end-pos)
+
       (while (< pos aidermacs--syntax-block-end-pos)
         (let* ((next-font-pos (or (next-property-change font-pos fontified) (length fontified)))
                (next-pos (+ aidermacs--syntax-block-start-pos next-font-pos))
                (face (get-text-property font-pos 'face fontified)))
           (ansi-color-apply-overlay-face pos next-pos face)
-          (setq pos next-pos
-                font-pos next-font-pos))))
-
-    ;; If we found the end marker, finalize the block
-    (when end-of-block-p
-      (when (equal aidermacs--syntax-block-delimiter aidermacs-diff-marker)
-        ;; we will need to process the other half of the SEARCH/REPLACE block.
-        ;; Backup so it will get matched
-        (beginning-of-line))
-      (aidermacs-reset-font-lock-state))))
+          ;; Detect potential infinite loop - position didn't advance
+          (if (eq pos next-pos)
+              (progn
+                (display-warning 'aidermacs
+				 (format "aidermacs: Font-lock position didn't advance at pos %d" pos))
+                (setq pos aidermacs--syntax-block-end-pos))
+            (setq pos next-pos
+                  font-pos next-font-pos)))))
+    end-of-block-p))
 
 (defun aidermacs--guess-major-mode ()
   "Extract the major mode from fence markers or filename."
@@ -272,7 +286,7 @@ _OUTPUT is the text to be processed."
      (let ((file (match-string 1)))
        (cdr (cl-assoc-if (lambda (re) (string-match re file)) auto-mode-alist))))
    (progn
-     (message "aidermacs warning: can't detect major mode at %d" (point))
+     (message "aidermacs: can't detect major mode at %d" (point))
      'fundamental-mode)))
 
 (defun aidermacs--comint-cleanup-hook ()
@@ -302,16 +316,9 @@ BUFFER-NAME is the name for the aidermacs buffer."
     (unless (comint-check-proc buffer-name)
       (apply #'make-comint-in-buffer "aidermacs" buffer-name program nil args)
       (with-current-buffer buffer-name
-        (comint-mode)
-        (setq-local comint-prompt-regexp aidermacs-prompt-regexp)
-        (setq-local comint-input-sender 'aidermacs-input-sender)
+        (aidermacs-comint-mode)
         (setq aidermacs--syntax-work-buffer
-              (get-buffer-create (concat " *aidermacs-syntax" buffer-name)))
-        (add-hook 'kill-buffer-hook #'aidermacs--comint-cleanup-hook nil t)
-        (add-hook 'comint-output-filter-functions #'aidermacs-fontify-blocks 100 t)
-        (add-hook 'comint-output-filter-functions #'aidermacs--comint-output-filter)
-        (aidermacs-comint-mode 1)
-        (font-lock-add-keywords nil aidermacs-font-lock-keywords t)))))
+              (get-buffer-create (concat " *aidermacs-syntax" buffer-name)))))))
 
 (defun aidermacs--send-command-comint (buffer command)
   "Send command to the aidermacs comint buffer.
@@ -361,10 +368,47 @@ The output is collected and passed to the current callback."
     map)
   "Keymap used when `aidermacs-comint-mode' is enabled.")
 
-(define-minor-mode aidermacs-comint-mode
-  "Minor mode for vterm backend buffer used by aidermacs."
-  :init-value nil
-  :keymap aidermacs-comint-mode-map)
+(define-derived-mode aidermacs-comint-mode comint-mode "Aider"
+  "Major mode for interacting with Aidermacs.
+Inherits from `comint-mode' with some Aider-specific customizations.
+\\{aider-comint-mode-map}"
+  :keymap aidermacs-comint-mode-map
+  (setq-local comint-prompt-regexp aidermacs-prompt-regexp)
+  (setq-local comint-input-sender 'aidermacs-input-sender)
+  (add-hook 'kill-buffer-hook #'aidermacs--comint-cleanup-hook nil t)
+  (add-hook 'comint-output-filter-functions #'aidermacs-fontify-blocks 100 t)
+  (add-hook 'comint-output-filter-functions #'aidermacs--comint-output-filter)
+
+  ;; we are going to highlight code blocks ourselves, so set those faces to default. They will still
+  ;; be inserted, but won't be noticeable
+  (setq-local markdown-fontify-code-blocks-natively nil)
+  (let ((inline-foreground (face-attribute 'markdown-inline-code-face :foreground nil 'default))
+        (table-foreground (face-attribute 'markdown-table-face :foreground nil 'default)))
+    (face-remap-add-relative 'markdown-pre-face  :inherit 'default)
+    (face-remap-add-relative 'markdown-code-face  :inherit 'default)
+    ;; preseve these two faces that inherit from markdown-code-face
+    (face-remap-add-relative 'markdown-inline-code-face  :foreground inline-foreground)
+    (face-remap-add-relative 'markdown-table-face  :foreground table-foreground))
+
+  ;; Enable markdown mode highlighting
+  (add-hook 'syntax-propertize-extend-region-functions
+            #'markdown-syntax-propertize-extend-region nil t)
+  (add-hook 'jit-lock-after-change-extend-region-functions
+            #'markdown-font-lock-extend-region-function t t)
+  (set-syntax-table (make-syntax-table markdown-mode-syntax-table))
+  (setq-local syntax-propertize-function #'markdown-syntax-propertize)
+  (setq font-lock-defaults
+        '(markdown-mode-font-lock-keywords
+          nil nil nil nil
+          (font-lock-multiline . t)
+          (font-lock-extra-managed-props
+           . (composition display invisible))))
+  ;; a regex that will never match so we don't get the prompt interpreted as a block quote
+  (setq-local markdown-regex-blockquote "^\\_>$")
+  (if markdown-hide-markup
+      (add-to-invisibility-spec 'markdown-markup)
+    (remove-from-invisibility-spec 'markdown-markup))
+  (font-lock-add-keywords nil aidermacs-font-lock-keywords t))
 
 (provide 'aidermacs-backend-comint)
 

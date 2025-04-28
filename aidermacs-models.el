@@ -1,6 +1,6 @@
 ;;; aidermacs-models.el --- Model selection for aidermacs -*- lexical-binding: t; -*-
 ;; Author: Mingde (Matthew) Zeng <matthewzmd@posteo.net>
-;; Version: 1.0
+;; Version: 1.3
 ;; Keywords: ai emacs llm aider ai-pair-programming tools
 ;; URL: https://github.com/MatthewZMD/aidermacs
 ;; SPDX-License-Identifier: Apache-2.0
@@ -26,13 +26,17 @@
 (require 'json)
 (require 'url)
 
-(defvar url-http-end-of-headers)
-
-(declare-function aidermacs--send-command "aidermacs" (command &optional no-switch-to-buffer use-existing redirect callback))
-(declare-function aidermacs-buffer-name "aidermacs" ())
-(declare-function aidermacs-exit "aidermacs" ())
+(declare-function aidermacs--send-command "aidermacs")
+(declare-function aidermacs-buffer-name "aidermacs")
+(declare-function aidermacs-exit "aidermacs")
+(declare-function aidermacs-aider-version "aidermacs")
+(declare-function aidermacs-get-buffer-name "aidermacs")
 
 (defvar aidermacs--current-output)
+(defvar aidermacs-use-architect-mode)
+(defvar aidermacs--current-mode)
+
+(defvar url-http-end-of-headers)
 
 (defgroup aidermacs-models nil
   "Model selection for Aidermacs."
@@ -42,127 +46,197 @@
   "Default AI model to use for aidermacs sessions when not in Architect mode."
   :type 'string)
 
-(defcustom aidermacs-architect-model "sonnet"
-  "Default AI model to use for architectural reasoning in aidermacs sessions."
-  :type 'string)
+(defcustom aidermacs-architect-model nil
+  "Default reasoning AI model to use for architect mode.
+If nil, uses the value of `aidermacs-default-model'."
+  :type '(choice (const :tag "Use default model" nil)
+                 (string :tag "Specific model")))
 
-(defcustom aidermacs-editor-model aidermacs-default-model
-  "Default AI model to use for code editing in aidermacs sessions.
-Defaults to `aidermacs-default-model` if not explicitly set."
-  :type 'string)
+(defcustom aidermacs-editor-model nil
+  "Default editing AI model to use for architect mode.
+If nil, uses the value of `aidermacs-default-model'."
+  :type '(choice (const :tag "Use default model" nil)
+                 (string :tag "Specific model")))
 
-(defcustom aidermacs-use-architect-mode nil
-  "If non-nil, use separate Architect/Editor mode."
-  :type 'boolean)
+(defcustom aidermacs-weak-model nil
+  "Default weak AI model to use.
+If nil, uses a model automatically selected based on the default model."
+  :type '(choice (const :tag "Use default model" nil)
+                 (string :tag "Specific model")))
 
-(defcustom aidermacs-popular-models
-  '("sonnet"
-    "o1-mini"
-    "gemini/gemini-2.0-flash"
-    "r1"
-    "deepseek/deepseek-chat")
-  "List of available AI models for selection.
-Each model should be in the format expected by the aidermacs CLI.
-Also based on aidermacs LLM benchmark: https://aidermacs.chat/docs/leaderboards/"
-  :type '(repeat string))
-
-(defvar aidermacs--cached-models aidermacs-popular-models
+(defvar aidermacs--cached-models nil
   "Cache of available AI models.")
 
-(defun aidermacs--fetch-openai-compatible-models (url)
+(defun aidermacs-get-architect-model ()
+  "Get the effective architect model, falling back to default if not set."
+  (or aidermacs-architect-model aidermacs-default-model))
+
+(defun aidermacs-get-editor-model ()
+  "Get the effective editor model, falling back to default if not set."
+  (or aidermacs-editor-model aidermacs-default-model))
+
+(defun aidermacs-get-weak-model ()
+  "Get the effective weak model, falling back to default if not set."
+  (or aidermacs-weak-model aidermacs-default-model))
+
+(defconst aidermacs--api-providers
+  '(("https://openrouter.ai/api/v1" . ((hostname . "openrouter.ai")
+                                       (prefix . "openrouter")
+                                       (env-var . "OPENROUTER_API_KEY")
+                                       (auth-header . (("Authorization" . "Bearer %s")))
+                                       (models-path . "/models")
+                                       (models-key . data)))
+    ("https://api.openai.com/v1" . ((hostname . "api.openai.com")
+                                    (prefix . "openai")
+                                    (env-var . "OPENAI_API_KEY")
+                                    (auth-header . (("Authorization" . "Bearer %s")))
+                                    (models-path . "/models")
+                                    (models-key . data)))
+    ("https://api.deepseek.com" . ((hostname . "api.deepseek.com")
+                                   (prefix . "deepseek")
+                                   (env-var . "DEEPSEEK_API_KEY")
+                                   (auth-header . (("Authorization" . "Bearer %s")))
+                                   (models-path . "/models")
+                                   (models-key . data)))
+    ("https://api.anthropic.com/v1" . ((hostname . "api.anthropic.com")
+                                       (prefix . "anthropic")
+                                       (env-var . "ANTHROPIC_API_KEY")
+                                       (auth-header . (("x-api-key" . "%s")
+                                                       ("anthropic-version" . "2023-06-01")))
+                                       (models-path . "/models")
+                                       (models-key . data)))
+    ("https://generativelanguage.googleapis.com/v1beta" . ((hostname . "generativelanguage.googleapis.com")
+                                                           (prefix . "gemini")
+                                                           (env-var . "GEMINI_API_KEY")
+                                                           (auth-header . nil)
+                                                           (models-path . "/models?key=%s")
+                                                           (models-key . models)
+                                                           (model-name-transform . (lambda (name)
+                                                                                     (replace-regexp-in-string "^models/" "" name)))))
+    ("https://api.x.ai/v1" . ((hostname . "api.x.ai")
+                              (prefix . "xai")
+                              (env-var . "XAI_API_KEY")
+                              (auth-header . (("Authorization" . "Bearer %s")))
+                              (models-path . "/models")
+                              (models-key . data))))
+  "Configuration for different API providers.
+Each entry maps a base URL to a configuration alist with:
+- hostname: The API hostname
+- prefix: Prefix to add to model names
+- env-var: Environment variable containing the API key
+- auth-header: Headers for authentication (nil if not needed)
+- models-path: Path to fetch models, with %s for token if needed
+- models-key: JSON key containing the models list
+- model-name-transform: Optional function to transform model names")
+
+(defun aidermacs--fetch-openai-compatible-models (url token)
   "Fetch available models from an OpenAI compatible API endpoint.
 URL should be the base API endpoint, e.g. https://api.openai.com/v1.
+TOKEN is the API token for authentication.
 Returns a list of model names with appropriate prefixes based on the
 API provider."
-  (let* ((url-parsed (url-generic-parse-url url))
-         (hostname (url-host url-parsed))
-         (prefix (pcase hostname
-                   ("api.openai.com" "openai")
-                   ("openrouter.ai" "openrouter")
-                   ("api.deepseek.com" "deepseek")
-                   ("api.anthropic.com" "anthropic")
-                   ("generativelanguage.googleapis.com" "gemini")
-                   (_ (error "Unknown API host: %s" hostname))))
-         (token (pcase hostname
-                  ("api.openai.com" (getenv "OPENAI_API_KEY"))
-                  ("openrouter.ai" (getenv "OPENROUTER_API_KEY"))
-                  ("api.deepseek.com" (getenv "DEEPSEEK_API_KEY"))
-                  ("api.anthropic.com" (getenv "ANTHROPIC_API_KEY"))
-                  ("generativelanguage.googleapis.com" (getenv "GEMINI_API_KEY"))
-                  (_ (error "Unknown API host: %s" hostname)))))
+  (let* ((provider-config (cdr (assoc url aidermacs--api-providers)))
+         (prefix (alist-get 'prefix provider-config))
+         (auth-headers (alist-get 'auth-header provider-config))
+         (models-path (alist-get 'models-path provider-config))
+         (models-key (alist-get 'models-key provider-config))
+         (transform-fn (alist-get 'model-name-transform provider-config)))
+
+    (unless provider-config
+      (error "Unknown API URL: %s" url))
+
     (with-local-quit
       (with-current-buffer
           (let ((url-request-extra-headers
-                 (pcase hostname
-                   ("api.anthropic.com"
-                    `(("x-api-key" . ,token)
-                      ("anthropic-version" . "2023-06-01")))
-                   ("generativelanguage.googleapis.com"
-                    nil)  ; No auth headers for Gemini, key is in URL
-                   (_
-                    `(("Authorization" . ,(concat "Bearer " token)))))))
+                 (when auth-headers
+                   (mapcar (lambda (header)
+                             (cons (car header)
+                                   (format (cdr header) token)))
+                           auth-headers))))
             (url-retrieve-synchronously
-             (if (string= hostname "generativelanguage.googleapis.com")
-                 (concat url "/models?key=" token)
-               (concat url "/models"))))
+             (concat url (if (string-match-p "%s" models-path)
+                             (format models-path token)
+                           models-path))))
+
         (goto-char url-http-end-of-headers)
         (let* ((json-object-type 'alist)
                (json-data (json-read))
-               (models (if (string= hostname "generativelanguage.googleapis.com")
-                           (alist-get 'models json-data)
-                         (alist-get 'data json-data))))
+               (models (alist-get models-key json-data)))
           (mapcar (lambda (model)
                     (concat prefix "/"
                             (cond
-                             ((string= hostname "generativelanguage.googleapis.com")
-                              (replace-regexp-in-string "^models/" "" (alist-get 'name model)))
-                             ((stringp model) model)  ; Handle case where model is just a string
+                             (transform-fn (funcall transform-fn (alist-get 'name model)))
+                             ((stringp model) model)
                              (t (or (alist-get 'id model)
                                     (alist-get 'name model))))))
                   models))))))
 
-(defun aidermacs--select-model ()
-  "Provide model selection with completion.
-This is a private function used internally."
+(defun aidermacs--select-model (&optional set-weak-model)
+  "Provide model selection with completion, handling main/weak/editor models.
+When SET-WEAK-MODEL is non-nil, only allow setting the weak model."
   (condition-case nil
-      (let ((model (completing-read "Select AI model: " aidermacs--cached-models nil t)))
+      (let* ((aider-version (aidermacs-aider-version))
+             (supports-specific-model (version<= "0.78.0" aider-version))
+             (is-architect-mode (and (eq aidermacs--current-mode 'architect) supports-specific-model))
+             (set-weak-model (and set-weak-model supports-specific-model))
+             (model-type
+              (cond
+               (set-weak-model "Weak Model")
+               (is-architect-mode
+                (completing-read
+                 "Select model type: "
+                 '("Main/Reasoning Model" "Editing Model")
+                 nil t))
+               (t "Main Model")))
+             (model (completing-read (format "Select %s: " model-type) aidermacs--cached-models nil t)))
         (when model
-          (aidermacs--send-command (format "/model %s" model))))
+          (cond
+           (set-weak-model
+            (setq aidermacs-weak-model model)
+            (aidermacs--send-command (format "/weak-model %s" model)))
+           ((and is-architect-mode supports-specific-model)
+            (pcase model-type
+              ("Main/Reasoning Model"
+               (setq aidermacs-architect-model model)
+               (aidermacs--send-command (format "/model %s" model)))
+              ("Editing Model"
+               (setq aidermacs-editor-model model)
+               (aidermacs--send-command (format "/editor-model %s" model)))))
+           (t
+            (setq aidermacs-default-model model)
+            (aidermacs--send-command (format "/model %s" model))))))
     (quit (message "Model selection cancelled"))))
 
 (defun aidermacs--get-available-models ()
-  "Get list of models supported by aider using the /models command.
-This fetches models from various API providers and caches them."
+  "Get list of models supported by aider using the /models command."
   (aidermacs--send-command
    "/models /" nil nil t
    (lambda ()
-     (let* ((supported-models
-             (seq-filter
-              (lambda (line)
-                (string-prefix-p "- " line))
-              (split-string aidermacs--current-output "\n" t)))
-            (models nil))
-       (setq supported-models
+     (let* ((all-models
              (mapcar (lambda (line)
                        (substring line 2)) ; Remove "- " prefix
-                     supported-models))
-       (dolist (url-token-pair '(("https://api.openai.com/v1" . "OPENAI_API_KEY")
-                                 ("https://openrouter.ai/api/v1" . "OPENROUTER_API_KEY")
-                                 ("https://api.deepseek.com" . "DEEPSEEK_API_KEY")
-                                 ("https://api.anthropic.com/v1" . "ANTHROPIC_API_KEY")
-                                 ("https://generativelanguage.googleapis.com/v1beta" . "GEMINI_API_KEY")))
-         (let ((url (car url-token-pair))
-               (token-value (getenv (cdr url-token-pair))))
+                     (seq-filter
+                      (lambda (line)
+                        (string-prefix-p "- " line))
+                      (split-string aidermacs--current-output "\n" t))))
+            (models))
+       (dolist (provider-entry aidermacs--api-providers)
+         (let* ((url (car provider-entry))
+                (config (cdr provider-entry))
+                (env-var (alist-get 'env-var config))
+                (token-value (getenv env-var)))
            (when (and token-value (not (string-empty-p token-value)))
              (condition-case err
-                 (let* ((fetched-models (aidermacs--fetch-openai-compatible-models url))
+                 (let* ((fetched-models (aidermacs--fetch-openai-compatible-models url token-value))
                         (filtered-models (seq-filter (lambda (model)
-                                                       (member model supported-models))
+                                                       (member model all-models))
                                                      fetched-models)))
                    (setq models (append models filtered-models)))
-               (error (message "Failed to fetch models from %s: %s" url (error-message-string err)))))))
-       (setq aidermacs--cached-models models)
-       (aidermacs--select-model)))))
+               (error "Failed to fetch models from %s: %s" url (error-message-string err))))))
+       ;; If we couldn't fetch any models from APIs, just use all supported models list
+       (if models
+           (setq aidermacs--cached-models models)
+         (setq aidermacs--cached-models all-models))))))
 
 (defun aidermacs-clear-model-cache ()
   "Clear the cached models, forcing a fresh fetch on next use.
@@ -171,19 +245,13 @@ This is useful when available models have changed."
   (setq aidermacs--cached-models nil)
   (message "Model cache cleared"))
 
-;;;###autoload
-(defun aidermacs-change-model ()
-  "Interactively select and change AI model in current aidermacs session."
-  (interactive)
-  (when (and aidermacs--cached-models
-             (equal aidermacs--cached-models aidermacs-popular-models)
-             (fboundp 'aidermacs-get-buffer-name)
-             (get-buffer (aidermacs-get-buffer-name)))
-    (setq aidermacs--cached-models nil))
-
-  (if aidermacs--cached-models
-      (aidermacs--select-model)
-    (aidermacs--get-available-models)))
+(defun aidermacs-change-model (&optional arg)
+  "Interactively select and change AI model in current aidermacs session.
+With prefix ARG, only allow setting the weak model."
+  (interactive "P")
+  (unless aidermacs--cached-models
+    (aidermacs--get-available-models))
+  (aidermacs--select-model arg))
 
 (provide 'aidermacs-models)
 ;;; aidermacs-models.el ends here

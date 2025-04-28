@@ -1,6 +1,6 @@
 ;;; aidermacs-backends.el --- Backend dispatcher for aidermacs -*- lexical-binding: t; -*-
 ;; Author: Mingde (Matthew) Zeng <matthewzmd@posteo.net>
-;; Version: 1.0
+;; Version: 1.3
 ;; Keywords: ai emacs llm aider ai-pair-programming tools
 ;; URL: https://github.com/MatthewZMD/aidermacs
 ;; SPDX-License-Identifier: Apache-2.0
@@ -24,11 +24,11 @@
 (when (commandp 'vterm)
   (require 'aidermacs-backend-vterm))
 
-(declare-function aidermacs-run-vterm "aidermacs-backend-vterm" (program args buffer-name))
-(declare-function aidermacs--send-command-vterm "aidermacs-backend-vterm" (buffer command))
+(declare-function aidermacs-run-vterm "aidermacs-backend-vterm")
+(declare-function aidermacs--send-command-vterm "aidermacs-backend-vterm")
 (declare-function aidermacs--prepare-for-code-edit "aidermacs-output")
 (declare-function aidermacs-project-root "aidermacs")
-(declare-function aidermacs--get-files-in-session "aidermacs" (callback))
+(declare-function aidermacs--get-files-in-session "aidermacs")
 
 (defgroup aidermacs-backends nil
   "Backend dispatcher for aidermacs."

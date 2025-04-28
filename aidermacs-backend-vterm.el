@@ -1,6 +1,6 @@
 ;;; aidermacs-backend-vterm.el --- VTerm backend for aidermacs -*- lexical-binding: t; -*-
 ;; Author: Mingde (Matthew) Zeng <matthewzmd@posteo.net>
-;; Version: 1.0
+;; Version: 1.3
 ;; Keywords: ai emacs llm aider ai-pair-programming tools
 ;; URL: https://github.com/MatthewZMD/aidermacs
 ;; SPDX-License-Identifier: Apache-2.0
@@ -44,7 +44,7 @@
 (declare-function aidermacs-get-buffer-name "aidermacs")
 (declare-function aidermacs--store-output "aidermacs-output")
 (declare-function aidermacs--prepare-for-code-edit "aidermacs-output")
-(declare-function aidermacs--parse-output-for-files "aidermacs-output" (output))
+(declare-function aidermacs--parse-output-for-files "aidermacs-output")
 (declare-function aidermacs--show-ediff-for-edited-files "aidermacs-output")
 (declare-function aidermacs--cleanup-temp-buffers "aidermacs-output")
 
@@ -155,16 +155,10 @@ Use BUFFER if provided, otherwise retrieve it from `aidermacs-get-buffer-name'."
         (setq aidermacs--vterm-active-timer nil)))))
 
 
-(defun aidermacs--vterm-filter-buffer-substring (beg end &optional delete)
-  "Filter text from BEG to END in vterm buffer for cleaner display.
-When DELETE is non-nil, extract and delete the region instead of copying it."
-  (let* ((text (cond
-                (delete
-                 (save-excursion
-                   (goto-char beg)
-                   (delete-and-extract-region beg end)))
-                (t
-                 (buffer-substring beg end))))
+(defun aidermacs--vterm-filter-buffer-substring (orig-fun &rest args)
+  "Filter text using ORIG-FUN with ARGS for cleaner vterm display.
+Converts multiple spaces to newlines and trims trailing whitespace."
+  (let* ((text (apply orig-fun args))
          (space-fixed (replace-regexp-in-string "[ \t]{3,}" "\n" text))
          (lines (split-string space-fixed "\n"))
          (clean-lines (mapcar #'string-trim-right lines))
@@ -340,7 +334,8 @@ _ARGS are the arguments."
   "Minor mode for vterm backend buffer used by aidermacs."
   :init-value nil
   :keymap aidermacs-vterm-mode-map
-  (setq-local filter-buffer-substring-function 'aidermacs--vterm-filter-buffer-substring))
+  (add-function :around (local 'filter-buffer-substring-function)
+                #'aidermacs--vterm-filter-buffer-substring))
 
 (provide 'aidermacs-backend-vterm)
 ;;; aidermacs-backend-vterm.el ends here
